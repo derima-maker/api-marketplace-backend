@@ -1,4 +1,8 @@
 import os
+print("✅ Flask app is starting...")
+print(f"🔧 PORT: {os.environ.get('PORT', 'not set')}")
+print(f"🔧 DATABASE_URL: {os.environ.get('DATABASE_URL', 'not set')[:20]}...")
+import os
 import jwt
 import bcrypt
 import datetime
@@ -582,4 +586,6 @@ with app.app_context():
         print("✅ Seeding complete! Login with demo@example.com / demo123 or admin@example.com / admin123")
 
 if __name__ == '__main__':
-    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    port = int(os.environ.get('PORT', 10000))
+    print(f"🚀 Starting server on port {port}...")
+    app.run(host='0.0.0.0', port=port, debug=False)
