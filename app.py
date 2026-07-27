@@ -582,4 +582,4 @@ with app.app_context():
         print("✅ Seeding complete! Login with demo@example.com / demo123 or admin@example.com / admin123")
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
