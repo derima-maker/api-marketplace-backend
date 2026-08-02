@@ -1,8 +1,5 @@
 import os
-print("✅ Flask app is starting...")
-print(f"🔧 PORT: {os.environ.get('PORT', 'not set')}")
-print(f"🔧 DATABASE_URL: {os.environ.get('DATABASE_URL', 'not set')[:20]}...")
-import os
+import sys
 import jwt
 import bcrypt
 import datetime
@@ -16,17 +13,49 @@ from dotenv import load_dotenv
 import requests
 import json
 
-load_dotenv()
+print("=" * 50)
+print("🚀 Starting API Marketplace Backend...")
+print("=" * 50)
+
+try:
+    load_dotenv()
+    print("✅ .env loaded")
+except Exception as e:
+    print(f"❌ .env load error: {e}")
 
 app = Flask(__name__)
 CORS(app)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///marketplace.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'fallback-dev-key')
-app.config['COMMISSION_PERCENT'] = float(os.getenv('COMMISSION_PERCENT', 10))
+# ─── CONFIG ──────────────────────────────────────────────
+DATABASE_URL = os.getenv('DATABASE_URL')
+SECRET_KEY = os.getenv('SECRET_KEY')
+COMMISSION_PERCENT = float(os.getenv('COMMISSION_PERCENT', 10))
 
-db = SQLAlchemy(app)
+print(f"🔧 DATABASE_URL: {DATABASE_URL[:30]}..." if DATABASE_URL else "❌ DATABASE_URL NOT SET!")
+print(f"🔧 SECRET_KEY: {'✅ SET' if SECRET_KEY else '❌ NOT SET!'}")
+print(f"🔧 COMMISSION_PERCENT: {COMMISSION_PERCENT}")
+
+if not DATABASE_URL:
+    print("❌ ERROR: DATABASE_URL environment variable is missing!")
+    print("💡 Please add it in Render Environment Variables")
+    sys.exit(1)
+
+if not SECRET_KEY:
+    print("❌ ERROR: SECRET_KEY environment variable is missing!")
+    print("💡 Please add it in Render Environment Variables")
+    sys.exit(1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = SECRET_KEY
+app.config['COMMISSION_PERCENT'] = COMMISSION_PERCENT
+
+try:
+    db = SQLAlchemy(app)
+    print("✅ SQLAlchemy initialized")
+except Exception as e:
+    print(f"❌ SQLAlchemy error: {e}")
+    sys.exit(1)
 
 # ─── HELPERS ──────────────────────────────────────────────
 def generate_user_api_key():
@@ -73,6 +102,7 @@ class User(db.Model):
     name = db.Column(db.String(100), nullable=False)
     role = db.Column(db.String(20), default='consumer')
     api_key = db.Column(db.String(100), unique=True, nullable=False, default=generate_user_api_key)
+    verified = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     earnings = db.Column(db.Float, default=0.0)
 
@@ -82,6 +112,7 @@ class User(db.Model):
             'email': self.email,
             'name': self.name,
             'role': self.role,
+            'verified': self.verified,
             'created_at': self.created_at.isoformat(),
             'earnings': self.earnings
         }
@@ -237,9 +268,9 @@ class ForumPost(db.Model):
             'createdAt': self.created_at.isoformat()
         }
 
-# ─── ROUTES ──────────────────────────────────────────────
+print("✅ Models defined")
 
-# --- AUTH ---
+# ─── ROUTES ──────────────────────────────────────────────
 @app.route('/auth/register', methods=['POST'])
 def register():
     data = request.json
@@ -252,7 +283,7 @@ def register():
         return jsonify({'error': 'Email already exists'}), 400
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
-    user = User(email=email, password_hash=hashed.decode('utf-8'), name=name)
+    user = User(email=email, password_hash=hashed.decode('utf-8'), name=name, verified=False)
     db.session.add(user)
     db.session.commit()
     return jsonify({'success': True, 'user': user.to_dict(show_api_key=True)}), 201
@@ -269,6 +300,8 @@ def login():
         return jsonify({'error': 'Invalid credentials'}), 401
     if not bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
         return jsonify({'error': 'Invalid credentials'}), 401
+    if not user.verified:
+        return jsonify({'error': 'Please verify your email first.'}), 403
     token = jwt.encode({'user_id': user.id, 'exp': datetime.datetime.utcnow() + datetime.timedelta(days=7)},
                        app.config['SECRET_KEY'], algorithm='HS256')
     return jsonify({'success': True, 'token': token, 'user': user.to_dict(show_api_key=True)}), 200
@@ -278,18 +311,42 @@ def login():
 def get_me(current_user):
     return jsonify({'user': current_user.to_dict(show_api_key=True)}), 200
 
-# --- PRODUCTS ---
+@app.route('/auth/resend-verification', methods=['POST'])
+def resend_verification():
+    data = request.json
+    email = data.get('email')
+    user = User.query.filter_by(email=email).first()
+    if not user or user.verified:
+        return jsonify({'error': 'User not found or already verified'}), 400
+    return jsonify({'success': True, 'message': 'Verification email sent.'}), 200
+
 @app.route('/api/products', methods=['GET'])
 def get_products():
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
     category = request.args.get('category')
     min_rating = request.args.get('min_rating', type=float)
+    search = request.args.get('search', '').strip()
     query = Product.query
     if category:
         query = query.filter_by(category=category)
     if min_rating:
         query = query.filter(Product.avg_rating >= min_rating)
-    products = query.order_by(Product.created_at.desc()).all()
-    return jsonify([p.to_dict() for p in products]), 200
+    if search:
+        query = query.filter(
+            db.or_(
+                Product.name.ilike(f'%{search}%'),
+                Product.description.ilike(f'%{search}%')
+            )
+        )
+    paginated = query.order_by(Product.created_at.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    return jsonify({
+        'products': [p.to_dict() for p in paginated.items],
+        'total': paginated.total,
+        'page': page,
+        'per_page': per_page,
+        'pages': paginated.pages
+    }), 200
 
 @app.route('/api/products/<int:product_id>', methods=['GET'])
 def get_product(product_id):
@@ -341,7 +398,6 @@ def get_my_products(current_user):
     products = Product.query.filter_by(creator_id=current_user.id).all()
     return jsonify([p.to_dict() for p in products]), 200
 
-# --- PURCHASES ---
 @app.route('/api/products/<int:product_id>/purchase', methods=['POST'])
 @token_required
 def purchase_product(current_user, product_id):
@@ -400,7 +456,6 @@ def get_my_purchases(current_user):
     purchases = Purchase.query.filter_by(consumer_id=current_user.id).all()
     return jsonify([p.to_dict() for p in purchases]), 200
 
-# --- TEST PROXY ---
 @app.route('/test-proxy', methods=['POST'])
 @token_required
 def test_proxy(current_user):
@@ -437,13 +492,12 @@ def test_proxy(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# --- REVIEWS ---
 @app.route('/api/products/<int:product_id>/reviews', methods=['GET'])
 def get_reviews(product_id):
     reviews = Review.query.filter_by(product_id=product_id).order_by(Review.created_at.desc()).all()
     return jsonify([r.to_dict() for r in reviews]), 200
 
-@app.route('/api/products/<int:product_id>/reviews', methods=['POST'])
+@app.route('/api/products/<int:product_id>/reviews', methods(['POST'])
 @token_required
 def create_review(current_user, product_id):
     data = request.json
@@ -463,7 +517,6 @@ def create_review(current_user, product_id):
     db.session.commit()
     return jsonify(review.to_dict()), 201
 
-# --- FORUMS ---
 @app.route('/api/forum/topics', methods=['GET'])
 def get_topics():
     product_id = request.args.get('product_id', type=int)
@@ -503,7 +556,18 @@ def create_post(current_user, topic_id):
     db.session.commit()
     return jsonify(post.to_dict()), 201
 
-# --- ANALYTICS ---
+@app.route('/api/forum/topics/<int:topic_id>/pin', methods=['POST'])
+@token_required
+def pin_topic(current_user, topic_id):
+    topic = ForumTopic.query.get(topic_id)
+    if not topic:
+        return jsonify({'error': 'Topic not found'}), 404
+    data = request.json
+    pinned = data.get('pinned', False)
+    topic.pinned = pinned
+    db.session.commit()
+    return jsonify({'success': True, 'pinned': pinned}), 200
+
 @app.route('/api/analytics/me', methods=['GET'])
 @token_required
 def get_analytics(current_user):
@@ -515,15 +579,22 @@ def get_analytics(current_user):
     product_purchases = Purchase.query.filter(Purchase.product_id.in_(product_ids)).all() if product_ids else []
     total_api_calls = sum(p.requests_count for p in product_purchases)
     total_subscribers = len(product_purchases)
+    top_products = []
+    if my_products:
+        usage = {}
+        for p in my_products:
+            usage[p.id] = sum(pur.requests_count for pur in product_purchases if pur.product_id == p.id)
+        top_products = sorted(usage.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_products = [{'product_id': pid, 'calls': count, 'product_name': next((p.name for p in my_products if p.id == pid), 'Unknown')} for pid, count in top_products]
     return jsonify({
         'totalRequests': total_requests,
         'activeKeys': active_keys,
         'totalApiCalls': total_api_calls,
         'totalSubscribers': total_subscribers,
-        'myEarnings': current_user.earnings
+        'myEarnings': current_user.earnings,
+        'topProducts': top_products
     }), 200
 
-# --- ADMIN ---
 @app.route('/admin/users', methods=['GET'])
 @token_required
 def admin_list_users(current_user):
@@ -531,6 +602,34 @@ def admin_list_users(current_user):
         return jsonify({'error': 'Admin only'}), 403
     users = User.query.all()
     return jsonify([u.to_dict() for u in users]), 200
+
+@app.route('/admin/users/<int:user_id>', methods=['PUT'])
+@token_required
+def admin_update_user(current_user, user_id):
+    if current_user.role != 'admin':
+        return jsonify({'error': 'Admin only'}), 403
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    data = request.json
+    if 'role' in data:
+        user.role = data['role']
+    if 'earnings' in data:
+        user.earnings = data['earnings']
+    db.session.commit()
+    return jsonify({'success': True, 'user': user.to_dict()}), 200
+
+@app.route('/admin/users/<int:user_id>', methods=['DELETE'])
+@token_required
+def admin_delete_user(current_user, user_id):
+    if current_user.role != 'admin':
+        return jsonify({'error': 'Admin only'}), 403
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    db.session.delete(user)
+    db.session.commit()
+    return jsonify({'success': True}), 200
 
 @app.route('/admin/products', methods=['GET'])
 @token_required
@@ -540,52 +639,69 @@ def admin_list_products(current_user):
     products = Product.query.all()
     return jsonify([p.to_dict() for p in products]), 200
 
-# ─── SEED & RUN ──────────────────────────────────────────
+print("✅ Routes defined")
+
+# ─── SEED DATABASE ──────────────────────────────────────
 with app.app_context():
-    # Create instance folder if missing
-    os.makedirs(os.path.join(os.path.dirname(__file__), 'instance'), exist_ok=True)
-    db.create_all()
+    try:
+        db.create_all()
+        print("✅ Database tables created")
+    except Exception as e:
+        print(f"❌ Database table creation error: {e}")
+        sys.exit(1)
+
     if User.query.count() == 0:
         print("🌱 Seeding database with demo data...")
-        demo_user = User(
-            email='demo@example.com',
-            password_hash=bcrypt.hashpw('demo123'.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
-            name='Demo User'
-        )
-        admin_user = User(
-            email='admin@example.com',
-            password_hash=bcrypt.hashpw('admin123'.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
-            name='Admin',
-            role='admin'
-        )
-        db.session.add_all([demo_user, admin_user])
-        db.session.commit()
-        products = [
-            Product(creator_id=demo_user.id, name='Weather API', description='Real-time weather data.', category='Weather',
-                    icon='fa-cloud-sun', color='#4285f4', price_display='$5/month', plan_type='month', plan_duration=1,
-                    endpoint_url='https://api.weatherapi.com/v1/current.json'),
-            Product(creator_id=demo_user.id, name='Translate Pro', description='AI translation for 100+ languages.', category='Language',
-                    icon='fa-language', color='#34a853', price_display='$10/month', plan_type='month', plan_duration=1,
-                    endpoint_url='https://api.example.com/translate'),
-            Product(creator_id=demo_user.id, name='ImageForge AI', description='Generate images from text.', category='AI',
-                    icon='fa-image', color='#fbbc04', price_display='$15/month', plan_type='year', plan_duration=1,
-                    endpoint_url='https://api.example.com/image'),
-            Product(creator_id=demo_user.id, name='SMS Gateway', description='Send global SMS.', category='Communication',
-                    icon='fa-sms', color='#ea4335', price_display='$0.01/message', plan_type='day', plan_duration=30,
-                    endpoint_url='https://api.example.com/sms'),
-            Product(creator_id=demo_user.id, name='PayFlow API', description='Unified payment integration.', category='Finance',
-                    icon='fa-credit-card', color='#ff6d00', price_display='$29/month', plan_type='month', plan_duration=1,
-                    endpoint_url='https://api.example.com/pay'),
-            Product(creator_id=demo_user.id, name='Analytics Hub', description='Track user behavior.', category='Analytics',
-                    icon='fa-chart-pie', color='#7c4dff', price_display='Free', plan_type='lifetime', plan_duration=0,
-                    endpoint_url='https://api.example.com/analytics'),
-        ]
-        for p in products:
-            db.session.add(p)
-        db.session.commit()
-        print("✅ Seeding complete! Login with demo@example.com / demo123 or admin@example.com / admin123")
+        try:
+            demo_user = User(
+                email='demo@example.com',
+                password_hash=bcrypt.hashpw('demo123'.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+                name='Demo User',
+                verified=True
+            )
+            admin_user = User(
+                email='admin@example.com',
+                password_hash=bcrypt.hashpw('admin123'.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+                name='Admin',
+                role='admin',
+                verified=True
+            )
+            db.session.add_all([demo_user, admin_user])
+            db.session.commit()
+
+            products = [
+                Product(creator_id=demo_user.id, name='Weather API', description='Real-time weather data.', category='Weather',
+                        icon='fa-cloud-sun', color='#4285f4', price_display='$5/month', plan_type='month', plan_duration=1,
+                        endpoint_url='https://api.weatherapi.com/v1/current.json'),
+                Product(creator_id=demo_user.id, name='Translate Pro', description='AI translation for 100+ languages.', category='Language',
+                        icon='fa-language', color='#34a853', price_display='$10/month', plan_type='month', plan_duration=1,
+                        endpoint_url='https://api.example.com/translate'),
+                Product(creator_id=demo_user.id, name='ImageForge AI', description='Generate images from text.', category='AI',
+                        icon='fa-image', color='#fbbc04', price_display='$15/month', plan_type='year', plan_duration=1,
+                        endpoint_url='https://api.example.com/image'),
+                Product(creator_id=demo_user.id, name='SMS Gateway', description='Send global SMS.', category='Communication',
+                        icon='fa-sms', color='#ea4335', price_display='$0.01/message', plan_type='day', plan_duration=30,
+                        endpoint_url='https://api.example.com/sms'),
+                Product(creator_id=demo_user.id, name='PayFlow API', description='Unified payment integration.', category='Finance',
+                        icon='fa-credit-card', color='#ff6d00', price_display='$29/month', plan_type='month', plan_duration=1,
+                        endpoint_url='https://api.example.com/pay'),
+                Product(creator_id=demo_user.id, name='Analytics Hub', description='Track user behavior.', category='Analytics',
+                        icon='fa-chart-pie', color='#7c4dff', price_display='Free', plan_type='lifetime', plan_duration=0,
+                        endpoint_url='https://api.example.com/analytics'),
+            ]
+            for p in products:
+                db.session.add(p)
+            db.session.commit()
+            print("✅ Seeding complete! Login with demo@example.com / demo123 or admin@example.com / admin123")
+        except Exception as e:
+            print(f"❌ Seeding error: {e}")
+            sys.exit(1)
+
+print("=" * 50)
+print("✅ App is ready to start! 🚀")
+print("=" * 50)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    print(f"🚀 Starting server on port {port}...")
+    print(f"🔌 Starting server on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
