@@ -497,7 +497,7 @@ def get_reviews(product_id):
     reviews = Review.query.filter_by(product_id=product_id).order_by(Review.created_at.desc()).all()
     return jsonify([r.to_dict() for r in reviews]), 200
 
-@app.route('/api/products/<int:product_id>/reviews', methods(['POST'])
+@app.route('/api/products/<int:product_id>/reviews', methods=['POST'])
 @token_required
 def create_review(current_user, product_id):
     data = request.json
