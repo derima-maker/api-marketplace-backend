@@ -12,9 +12,20 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import requests
 import json
-import redis
-from cryptography.fernet import Fernet
-from datetime import timedelta
+import base64
+
+# Optional imports with fallbacks
+try:
+    import redis
+except ImportError:
+    redis = None
+    print("⚠️  Redis not available, using in-memory rate limiting")
+
+try:
+    from cryptography.fernet import Fernet
+except ImportError:
+    Fernet = None
+    print("⚠️  Cryptography not available, API keys will NOT be encrypted!")
 
 print("=" * 50)
 print("🚀 Starting API Marketplace Backend with Gateway...")
@@ -40,7 +51,7 @@ print(f"🔧 DATABASE_URL: {DATABASE_URL[:30]}..." if DATABASE_URL else "❌ DAT
 print(f"🔧 SECRET_KEY: {'✅ SET' if SECRET_KEY else '❌ NOT SET!'}")
 print(f"🔧 COMMISSION_PERCENT: {COMMISSION_PERCENT}")
 print(f"🔧 REDIS_URL: {REDIS_URL[:30]}..." if REDIS_URL else "❌ REDIS_URL NOT SET!")
-print(f"🔧 ENCRYPTION_KEY: {'✅ SET' if ENCRYPTION_KEY else '❌ NOT SET (will generate temp key)'}")
+print(f"🔧 ENCRYPTION_KEY: {'✅ SET' if ENCRYPTION_KEY else '❌ NOT SET (will generate temp key if cryptography is available)'}")
 
 if not DATABASE_URL:
     print("❌ ERROR: DATABASE_URL environment variable is missing!")
@@ -52,22 +63,32 @@ if not SECRET_KEY:
     print("💡 Please add it in Render Environment Variables")
     sys.exit(1)
 
-# Initialize encryption
-if not ENCRYPTION_KEY:
-    ENCRYPTION_KEY = Fernet.generate_key().decode()
-    print("⚠️  Generated temporary ENCRYPTION_KEY. Set it in .env for production!")
-
-cipher = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
+# Initialize encryption only if cryptography is available
+cipher = None
+if Fernet is not None:
+    if not ENCRYPTION_KEY:
+        ENCRYPTION_KEY = Fernet.generate_key().decode()
+        print("⚠️  Generated temporary ENCRYPTION_KEY. Set it in .env for production!")
+    try:
+        cipher = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
+        print("✅ Encryption initialized")
+    except Exception as e:
+        print(f"❌ Encryption initialization error: {e}")
+        cipher = None
+else:
+    print("⚠️  Encryption not available, API keys will be stored as plain text (insecure)")
 
 # Initialize Redis
-try:
-    redis_client = redis.from_url(REDIS_URL)
-    redis_client.ping()
-    print("✅ Redis connected")
-except Exception as e:
-    print(f"⚠️  Redis connection failed: {e}")
-    print("💡 Rate limiting will use in-memory fallback")
-    redis_client = None
+redis_client = None
+if redis is not None:
+    try:
+        redis_client = redis.from_url(REDIS_URL)
+        redis_client.ping()
+        print("✅ Redis connected")
+    except Exception as e:
+        print(f"⚠️  Redis connection failed: {e}")
+        print("💡 Rate limiting will use in-memory fallback")
+        redis_client = None
 
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -87,7 +108,7 @@ def generate_user_api_key():
 
 def generate_unique_purchase_key():
     """Generate a unique API key for a specific purchase."""
-    return 'mp_' + secrets.token_urlsafe(32)  # 'mp' = marketplace key
+    return 'mp_' + secrets.token_urlsafe(32)
 
 def generate_plan_expiry(plan_type, duration):
     if plan_type == 'lifetime':
@@ -103,15 +124,19 @@ def generate_plan_expiry(plan_type, duration):
 
 def encrypt_api_key(api_key):
     """Encrypt a creator's API key for storage."""
-    if not api_key:
-        return None
+    if not api_key or cipher is None:
+        return api_key  # store plain text if no encryption
     return cipher.encrypt(api_key.encode()).decode()
 
 def decrypt_api_key(encrypted_key):
     """Decrypt a creator's API key for use in proxied requests."""
-    if not encrypted_key:
-        return None
-    return cipher.decrypt(encrypted_key.encode()).decode()
+    if not encrypted_key or cipher is None:
+        return encrypted_key  # return as-is if plain text
+    try:
+        return cipher.decrypt(encrypted_key.encode()).decode()
+    except Exception:
+        # If decryption fails, maybe it's stored as plain text
+        return encrypted_key
 
 def check_rate_limit(user_id, product_id, tier_name):
     """Check if the user has exceeded their rate limit for this API."""
@@ -119,18 +144,18 @@ def check_rate_limit(user_id, product_id, tier_name):
         product = Product.query.get(product_id)
         if not product or not product.rate_limits:
             return True  # No limits configured
-        
+
         limits = json.loads(product.rate_limits)
         tier_limit = limits.get(tier_name)
-        
+
         if not tier_limit:
             return True  # No limit for this tier
-        
+
         # Parse "1000/month" format
         parts = tier_limit.split('/')
         count = int(parts[0])
         period = parts[1] if len(parts) > 1 else 'month'
-        
+
         # Calculate expiry based on period
         period_map = {
             'minute': 60,
@@ -141,30 +166,30 @@ def check_rate_limit(user_id, product_id, tier_name):
             'year': 31536000
         }
         expiry = period_map.get(period, 2592000)
-        
+
         # Use Redis if available, otherwise in-memory dict
         if redis_client:
             key = f"ratelimit:{user_id}:{product_id}:{tier_name}"
             current = redis_client.get(key)
-            
+
             if current is None:
                 redis_client.setex(key, expiry, 1)
                 return True
-            
+
             current = int(current)
             if current >= count:
                 return False
-            
+
             redis_client.incr(key)
             return True
         else:
-            # In-memory fallback (not recommended for production)
+            # In-memory fallback
             if not hasattr(app, 'rate_limit_store'):
                 app.rate_limit_store = {}
-            
+
             key = f"{user_id}:{product_id}:{tier_name}"
             now = datetime.datetime.utcnow()
-            
+
             if key in app.rate_limit_store:
                 data = app.rate_limit_store[key]
                 if (now - data['start']).total_seconds() > expiry:
@@ -245,16 +270,16 @@ class Product(db.Model):
     plan_duration = db.Column(db.Integer, default=0)
     endpoint_url = db.Column(db.String(255), nullable=True)
     documentation_url = db.Column(db.String(255), nullable=True)
-    
-    # NEW: Gateway configuration fields
-    auth_type = db.Column(db.String(20), default='header')  # 'header', 'bearer', 'query', 'basic'
-    auth_header_name = db.Column(db.String(50), default='X-API-Key')  # e.g., 'Authorization', 'X-API-Key'
-    creator_api_key = db.Column(db.String(500))  # The creator's master key (ENCRYPTED!)
-    rate_limits = db.Column(db.Text)  # JSON: {"Free": "100/day", "Pro": "10000/month"}
+
+    # Gateway configuration fields
+    auth_type = db.Column(db.String(20), default='header')
+    auth_header_name = db.Column(db.String(50), default='X-API-Key')
+    creator_api_key = db.Column(db.String(500))  # Encrypted or plain text
+    rate_limits = db.Column(db.Text)
     allowed_methods = db.Column(db.String(100), default='GET,POST,PUT,DELETE')
     api_version = db.Column(db.String(10), default='v1')
     is_public = db.Column(db.Boolean, default=True)
-    
+
     avg_rating = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
 
@@ -294,7 +319,7 @@ class Purchase(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     consumer_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=False)
-    key = db.Column(db.String(100), nullable=False, unique=True)  # Now unique per purchase
+    key = db.Column(db.String(100), nullable=False, unique=True)
     status = db.Column(db.String(20), default='active')
     purchased_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     expires_at = db.Column(db.DateTime, nullable=True)
@@ -419,7 +444,7 @@ def register():
         return jsonify({'error': 'Email already exists'}), 400
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
-    user = User(email=email, password_hash=hashed.decode('utf-8'), name=name, verified=True)  # Auto-verify for demo
+    user = User(email=email, password_hash=hashed.decode('utf-8'), name=name, verified=True)
     db.session.add(user)
     db.session.commit()
     token = jwt.encode({'user_id': user.id, 'exp': datetime.datetime.utcnow() + datetime.timedelta(days=7)},
@@ -460,9 +485,9 @@ def get_products():
     category = request.args.get('category')
     min_rating = request.args.get('min_rating', type=float)
     search = request.args.get('search', '').strip()
-    
+
     query = Product.query.filter_by(is_public=True)
-    
+
     if category:
         query = query.filter_by(category=category)
     if min_rating:
@@ -497,7 +522,7 @@ def create_product(current_user):
     required = ['name', 'description', 'category']
     if not all(k in data for k in required):
         return jsonify({'error': 'Missing fields'}), 400
-    
+
     product = Product(
         creator_id=current_user.id,
         name=data['name'],
@@ -518,11 +543,11 @@ def create_product(current_user):
         pricing_tiers=json.dumps(data.get('pricingTiers', [])),
         rate_limits=json.dumps(data.get('rateLimits', {}))
     )
-    
+
     # Encrypt the creator's API key if provided
     if data.get('apiKey'):
         product.creator_api_key = encrypt_api_key(data['apiKey'])
-    
+
     db.session.add(product)
     db.session.commit()
     return jsonify(product.to_dict(include_sensitive=True)), 201
@@ -536,7 +561,7 @@ def configure_gateway(current_user, product_id):
         return jsonify({'error': 'Product not found'}), 404
     if product.creator_id != current_user.id:
         return jsonify({'error': 'Permission denied'}), 403
-    
+
     data = request.json
     if 'endpointUrl' in data:
         product.endpoint_url = data['endpointUrl']
@@ -552,9 +577,9 @@ def configure_gateway(current_user, product_id):
         product.allowed_methods = data['allowedMethods']
     if 'isPublic' in data:
         product.is_public = data['isPublic']
-    
+
     db.session.commit()
-    
+
     return jsonify({
         'success': True,
         'product': product.to_dict(include_sensitive=True),
@@ -589,11 +614,11 @@ def purchase_product(current_user, product_id):
     product = Product.query.get(product_id)
     if not product:
         return jsonify({'error': 'Product not found'}), 404
-    
+
     data = request.json or {}
     tier_name = data.get('tierName')
     tiers = json.loads(product.pricing_tiers) if product.pricing_tiers else []
-    
+
     selected_tier = None
     if tier_name:
         selected_tier = next((t for t in tiers if t.get('name') == tier_name), None)
@@ -601,51 +626,49 @@ def purchase_product(current_user, product_id):
         selected_tier = tiers[0]
     if not selected_tier:
         selected_tier = {'name': 'Standard', 'price': 0, 'planType': product.plan_type, 'duration': product.plan_duration}
-    
+
     amount_paid = float(selected_tier.get('price', 0))
     plan_type = selected_tier.get('planType', 'lifetime')
     duration = int(selected_tier.get('duration', 0))
-    
-    # Check for existing purchase
+
     existing = Purchase.query.filter_by(consumer_id=current_user.id, product_id=product_id).first()
-    
+
     if existing:
         if existing.is_active():
             return jsonify({
-                'success': True, 
-                'key': existing.key, 
+                'success': True,
+                'key': existing.key,
                 'expiresAt': existing.expires_at.isoformat() if existing.expires_at else None,
                 'gatewayUrl': f"{request.host_url.rstrip('/')}/gateway/{product_id}/",
                 'message': 'Already have active subscription'
             }), 200
         else:
-            # Reactivate expired subscription with new key
+            # Reactivate with new key
             existing.key = generate_unique_purchase_key()
             existing.expires_at = generate_plan_expiry(plan_type, duration)
             existing.status = 'active'
             existing.tier_name = selected_tier['name']
             existing.amount_paid = amount_paid
             db.session.commit()
-            
-            # Handle commission
+
             if amount_paid > 0:
                 commission = amount_paid * app.config['COMMISSION_PERCENT'] / 100
                 creator = User.query.get(product.creator_id)
                 if creator:
                     creator.earnings += amount_paid - commission
                     db.session.commit()
-            
+
             return jsonify({
-                'success': True, 
-                'key': existing.key, 
+                'success': True,
+                'key': existing.key,
                 'expiresAt': existing.expires_at.isoformat() if existing.expires_at else None,
                 'gatewayUrl': f"{request.host_url.rstrip('/')}/gateway/{product_id}/"
             }), 200
-    
-    # New purchase with UNIQUE key
+
+    # New purchase with unique key
     expires_at = generate_plan_expiry(plan_type, duration)
     purchase_key = generate_unique_purchase_key()
-    
+
     purchase = Purchase(
         consumer_id=current_user.id,
         product_id=product_id,
@@ -655,19 +678,18 @@ def purchase_product(current_user, product_id):
         amount_paid=amount_paid
     )
     db.session.add(purchase)
-    
-    # Handle commission
+
     if amount_paid > 0:
         commission = amount_paid * app.config['COMMISSION_PERCENT'] / 100
         creator = User.query.get(product.creator_id)
         if creator:
             creator.earnings += amount_paid - commission
-    
+
     db.session.commit()
-    
+
     return jsonify({
-        'success': True, 
-        'key': purchase_key, 
+        'success': True,
+        'key': purchase_key,
         'expiresAt': expires_at.isoformat() if expires_at else None,
         'gatewayUrl': f"{request.host_url.rstrip('/')}/gateway/{product_id}/"
     }), 201
@@ -689,106 +711,101 @@ def api_gateway(product_id, endpoint):
     MAIN API GATEWAY - All consumer API calls go through here.
     Example: GET /gateway/1/weather?city=London
     """
-    
     # 1. Extract the consumer's marketplace API key
     consumer_key = request.headers.get('X-API-Key') or request.args.get('api_key')
-    
+
     if not consumer_key:
         return jsonify({'error': 'API key required. Use X-API-Key header or ?api_key= parameter'}), 401
-    
+
     # 2. Find the purchase by the unique key
     purchase = Purchase.query.filter_by(key=consumer_key).first()
-    
+
     if not purchase:
         return jsonify({'error': 'Invalid API key'}), 401
-    
+
     # 3. Verify the key matches the requested product
     if purchase.product_id != product_id:
         return jsonify({'error': 'API key does not match this product'}), 403
-    
+
     # 4. Check if the purchase is active
     if not purchase.is_active():
         return jsonify({'error': 'API key expired or inactive'}), 403
-    
+
     # 5. Get the product configuration
     product = Product.query.get(product_id)
     if not product or not product.endpoint_url:
         return jsonify({'error': 'API not configured'}), 404
-    
+
     # 6. Check if method is allowed
     if request.method not in product.allowed_methods.split(','):
         return jsonify({'error': f'Method {request.method} not allowed'}), 405
-    
+
     # 7. Rate limiting check
     if not check_rate_limit(purchase.consumer_id, product_id, purchase.tier_name):
         return jsonify({'error': 'Rate limit exceeded. Please upgrade your plan.'}), 429
-    
+
     # 8. Build the target URL (creator's actual API)
     creator_url = product.endpoint_url.rstrip('/')
     if endpoint:
         creator_url += '/' + endpoint.lstrip('/')
-    
-    # Add query parameters
+
+    # Add query parameters (except api_key)
     if request.args:
-        # Remove api_key from forwarded params
         params = {k: v for k, v in request.args.items() if k != 'api_key'}
         if params:
             query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
             creator_url += '?' + query_string
-    
+
     # 9. Prepare headers for the creator's API
     headers = {}
-    # Copy relevant headers from original request
     for header in ['Content-Type', 'Accept', 'User-Agent']:
         if header in request.headers:
             headers[header] = request.headers[header]
-    
+
     # Add the creator's authentication
     creator_key = decrypt_api_key(product.creator_api_key)
-    
+
     if product.auth_type == 'header':
         headers[product.auth_header_name] = creator_key
     elif product.auth_type == 'bearer':
         headers['Authorization'] = f'Bearer {creator_key}'
     elif product.auth_type == 'query':
-        # Append API key to URL
         separator = '&' if '?' in creator_url else '?'
         creator_url += f"{separator}{product.auth_header_name}={creator_key}"
     elif product.auth_type == 'basic':
-        import base64
         credentials = base64.b64encode(f"{creator_key}:".encode()).decode()
         headers['Authorization'] = f'Basic {credentials}'
-    
+
     # 10. Forward the request to the creator's server
     try:
         if request.method == 'GET':
             resp = requests.get(creator_url, headers=headers, timeout=30)
         elif request.method == 'POST':
-            resp = requests.post(creator_url, json=request.get_json(silent=True) or {}, 
+            resp = requests.post(creator_url, json=request.get_json(silent=True) or {},
                                headers=headers, timeout=30)
         elif request.method == 'PUT':
-            resp = requests.put(creator_url, json=request.get_json(silent=True) or {}, 
+            resp = requests.put(creator_url, json=request.get_json(silent=True) or {},
                               headers=headers, timeout=30)
         elif request.method == 'DELETE':
             resp = requests.delete(creator_url, headers=headers, timeout=30)
         elif request.method == 'PATCH':
-            resp = requests.patch(creator_url, json=request.get_json(silent=True) or {}, 
+            resp = requests.patch(creator_url, json=request.get_json(silent=True) or {},
                                 headers=headers, timeout=30)
         else:
             return jsonify({'error': 'Method not supported'}), 405
-        
+
         # 11. Log the request
         purchase.requests_count += 1
         purchase.last_used = datetime.datetime.utcnow()
         db.session.commit()
-        
-        # 12. Return the response to the consumer
+
+        # 12. Return the response
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         response_headers = [(name, value) for name, value in resp.raw.headers.items()
                            if name.lower() not in excluded_headers]
-        
+
         return Response(resp.content, resp.status_code, response_headers)
-        
+
     except requests.exceptions.Timeout:
         return jsonify({'error': 'Upstream API timeout'}), 504
     except requests.exceptions.ConnectionError:
@@ -804,36 +821,32 @@ def api_gateway(product_id, endpoint):
 @app.route('/test-proxy', methods=['POST'])
 @token_required
 def test_proxy(current_user):
-    """Test endpoint to verify gateway configuration (uses JWT auth, not API key)."""
+    """Test endpoint to verify gateway configuration (uses JWT auth)."""
     data = request.json
     product_id = data.get('productId')
     method = data.get('method', 'GET')
     path = data.get('path', '')
     body = data.get('body', {})
-    
+
     product = Product.query.get(product_id)
     if not product:
         return jsonify({'error': 'Product not found'}), 404
     if not product.endpoint_url:
         return jsonify({'error': 'No endpoint URL configured'}), 400
-    
-    # Check purchase
+
     purchase = Purchase.query.filter_by(consumer_id=current_user.id, product_id=product_id).first()
     if not purchase or not purchase.is_active():
         return jsonify({'error': 'No active subscription'}), 403
-    
-    # Build target URL
+
     target = product.endpoint_url.rstrip('/') + '/' + path.lstrip('/')
-    
-    # Prepare headers with creator's key
     headers = {'Content-Type': 'application/json'}
     creator_key = decrypt_api_key(product.creator_api_key)
-    
+
     if product.auth_type == 'header':
         headers[product.auth_header_name] = creator_key
     elif product.auth_type == 'bearer':
         headers['Authorization'] = f'Bearer {creator_key}'
-    
+
     try:
         if method.upper() == 'GET':
             resp = requests.get(target, headers=headers, timeout=10)
@@ -841,19 +854,19 @@ def test_proxy(current_user):
             resp = requests.post(target, json=body, headers=headers, timeout=10)
         else:
             return jsonify({'error': 'Method not supported'}), 400
-        
+
         purchase.requests_count += 1
         purchase.last_used = datetime.datetime.utcnow()
         db.session.commit()
-        
+
         try:
             response_data = resp.json()
         except:
             response_data = resp.text
-        
+
         return jsonify({
-            'status': resp.status_code, 
-            'headers': dict(resp.headers), 
+            'status': resp.status_code,
+            'headers': dict(resp.headers),
             'data': response_data
         }), 200
     except Exception as e:
@@ -876,19 +889,19 @@ def create_review(current_user, product_id):
     comment = data.get('comment')
     if not rating or rating < 1 or rating > 5:
         return jsonify({'error': 'Rating must be 1-5'}), 400
-    
+
     purchase = Purchase.query.filter_by(consumer_id=current_user.id, product_id=product_id).first()
     if not purchase:
         return jsonify({'error': 'You must have access to review'}), 403
-    
+
     review = Review(user_id=current_user.id, product_id=product_id, rating=rating, comment=comment)
     db.session.add(review)
-    
+
     product = Product.query.get(product_id)
     if product:
         all_reviews = Review.query.filter_by(product_id=product_id).all()
         product.avg_rating = sum(r.rating for r in all_reviews) / len(all_reviews) if all_reviews else rating
-    
+
     db.session.commit()
     return jsonify(review.to_dict()), 201
 
@@ -950,18 +963,16 @@ def pin_topic(current_user, topic_id):
 @app.route('/api/analytics/me', methods=['GET'])
 @token_required
 def get_analytics(current_user):
-    # Consumer analytics
     purchases = Purchase.query.filter_by(consumer_id=current_user.id).all()
     total_requests = sum(p.requests_count for p in purchases)
     active_keys = sum(1 for p in purchases if p.is_active())
-    
-    # Creator analytics
+
     my_products = Product.query.filter_by(creator_id=current_user.id).all()
     product_ids = [p.id for p in my_products]
     product_purchases = Purchase.query.filter(Purchase.product_id.in_(product_ids)).all() if product_ids else []
     total_api_calls = sum(p.requests_count for p in product_purchases)
     total_subscribers = len(product_purchases)
-    
+
     top_products = []
     if my_products:
         usage = {}
@@ -969,11 +980,11 @@ def get_analytics(current_user):
             usage[p.id] = sum(pur.requests_count for pur in product_purchases if pur.product_id == p.id)
         top_products = sorted(usage.items(), key=lambda x: x[1], reverse=True)[:5]
         top_products = [{
-            'product_id': pid, 
-            'calls': count, 
+            'product_id': pid,
+            'calls': count,
             'product_name': next((p.name for p in my_products if p.id == pid), 'Unknown')
         } for pid, count in top_products]
-    
+
     return jsonify({
         'totalRequests': total_requests,
         'activeKeys': active_keys,
@@ -1041,7 +1052,8 @@ def health_check():
         'status': 'healthy',
         'redis': redis_client is not None,
         'database': True,
-        'gateway': True
+        'gateway': True,
+        'encryption': cipher is not None
     }), 200
 
 print("✅ Routes defined")
@@ -1076,14 +1088,14 @@ with app.app_context():
 
             products = [
                 Product(
-                    creator_id=demo_user.id, 
-                    name='Weather API', 
+                    creator_id=demo_user.id,
+                    name='Weather API',
                     description='Real-time weather data for any location worldwide.',
                     category='Weather',
-                    icon='fa-cloud-sun', 
-                    color='#4285f4', 
-                    price_display='$5/month', 
-                    plan_type='month', 
+                    icon='fa-cloud-sun',
+                    color='#4285f4',
+                    price_display='$5/month',
+                    plan_type='month',
                     plan_duration=1,
                     endpoint_url='https://api.weatherapi.com/v1',
                     auth_type='header',
@@ -1097,14 +1109,14 @@ with app.app_context():
                     ])
                 ),
                 Product(
-                    creator_id=demo_user.id, 
-                    name='Translate Pro', 
+                    creator_id=demo_user.id,
+                    name='Translate Pro',
                     description='AI translation for 100+ languages.',
                     category='Language',
-                    icon='fa-language', 
-                    color='#34a853', 
-                    price_display='$10/month', 
-                    plan_type='month', 
+                    icon='fa-language',
+                    color='#34a853',
+                    price_display='$10/month',
+                    plan_type='month',
                     plan_duration=1,
                     endpoint_url='https://api.example.com/translate',
                     auth_type='bearer',
@@ -1117,14 +1129,14 @@ with app.app_context():
                     ])
                 ),
                 Product(
-                    creator_id=demo_user.id, 
-                    name='ImageForge AI', 
+                    creator_id=demo_user.id,
+                    name='ImageForge AI',
                     description='Generate images from text prompts.',
                     category='AI',
-                    icon='fa-image', 
-                    color='#fbbc04', 
-                    price_display='$15/month', 
-                    plan_type='year', 
+                    icon='fa-image',
+                    color='#fbbc04',
+                    price_display='$15/month',
+                    plan_type='year',
                     plan_duration=1,
                     endpoint_url='https://api.example.com/image',
                     auth_type='header',
@@ -1137,14 +1149,14 @@ with app.app_context():
                     ])
                 ),
                 Product(
-                    creator_id=demo_user.id, 
-                    name='SMS Gateway', 
+                    creator_id=demo_user.id,
+                    name='SMS Gateway',
                     description='Send global SMS messages.',
                     category='Communication',
-                    icon='fa-sms', 
-                    color='#ea4335', 
-                    price_display='$0.01/message', 
-                    plan_type='day', 
+                    icon='fa-sms',
+                    color='#ea4335',
+                    price_display='$0.01/message',
+                    plan_type='day',
                     plan_duration=30,
                     endpoint_url='https://api.example.com/sms',
                     auth_type='basic',
@@ -1157,14 +1169,14 @@ with app.app_context():
                     ])
                 ),
                 Product(
-                    creator_id=demo_user.id, 
-                    name='PayFlow API', 
+                    creator_id=demo_user.id,
+                    name='PayFlow API',
                     description='Unified payment integration.',
                     category='Finance',
-                    icon='fa-credit-card', 
-                    color='#ff6d00', 
-                    price_display='$29/month', 
-                    plan_type='month', 
+                    icon='fa-credit-card',
+                    color='#ff6d00',
+                    price_display='$29/month',
+                    plan_type='month',
                     plan_duration=1,
                     endpoint_url='https://api.example.com/pay',
                     auth_type='bearer',
@@ -1177,14 +1189,14 @@ with app.app_context():
                     ])
                 ),
                 Product(
-                    creator_id=demo_user.id, 
-                    name='Analytics Hub', 
+                    creator_id=demo_user.id,
+                    name='Analytics Hub',
                     description='Track user behavior and events.',
                     category='Analytics',
-                    icon='fa-chart-pie', 
-                    color='#7c4dff', 
-                    price_display='Free', 
-                    plan_type='lifetime', 
+                    icon='fa-chart-pie',
+                    color='#7c4dff',
+                    price_display='Free',
+                    plan_type='lifetime',
                     plan_duration=0,
                     endpoint_url='https://api.example.com/analytics',
                     auth_type='query',
