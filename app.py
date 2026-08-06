@@ -371,7 +371,7 @@ class ForumPost(db.Model):
 print("✅ Models defined")
 
 # ─── ROUTES ──────────────────────────────────────────────
-# (All routes from previous version remain exactly the same)
+
 # AUTH ROUTES
 @app.route('/auth/register', methods=['POST'])
 def register():
@@ -603,39 +603,63 @@ def get_my_purchases(current_user):
     purchases = Purchase.query.filter_by(consumer_id=current_user.id).all()
     return jsonify([p.to_dict() for p in purchases]), 200
 
-# API GATEWAY
+# ╔══════════════════════════════════════════════════════════╗
+# ║              API GATEWAY (CORE FEATURE)                  ║
+# ╚══════════════════════════════════════════════════════════╝
+
 @app.route('/gateway/<int:product_id>/', defaults={'endpoint': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
 @app.route('/gateway/<int:product_id>/<path:endpoint>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
 def api_gateway(product_id, endpoint):
+    # 1. Extract the consumer's marketplace API key
     consumer_key = request.headers.get('X-API-Key') or request.args.get('api_key')
     if not consumer_key:
         return jsonify({'error': 'API key required. Use X-API-Key header or ?api_key= parameter'}), 401
+
+    # 2. Find the purchase by the unique key
     purchase = Purchase.query.filter_by(key=consumer_key).first()
     if not purchase:
         return jsonify({'error': 'Invalid API key'}), 401
+
+    # 3. Verify the key matches the requested product
     if purchase.product_id != product_id:
         return jsonify({'error': 'API key does not match this product'}), 403
+
+    # 4. Check if the purchase is active
     if not purchase.is_active():
         return jsonify({'error': 'API key expired or inactive'}), 403
+
+    # 5. Get the product configuration
     product = Product.query.get(product_id)
     if not product or not product.endpoint_url:
         return jsonify({'error': 'API not configured'}), 404
+
+    # 6. Check if method is allowed
     if request.method not in product.allowed_methods.split(','):
         return jsonify({'error': f'Method {request.method} not allowed'}), 405
+
+    # 7. Rate limiting check
     if not check_rate_limit(purchase.consumer_id, product_id, purchase.tier_name):
         return jsonify({'error': 'Rate limit exceeded. Please upgrade your plan.'}), 429
+
+    # 8. Build the target URL (creator's actual API)
     creator_url = product.endpoint_url.rstrip('/')
     if endpoint:
         creator_url += '/' + endpoint.lstrip('/')
+
+    # Add query parameters (except api_key)
     if request.args:
         params = {k: v for k, v in request.args.items() if k != 'api_key'}
         if params:
             query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
             creator_url += '?' + query_string
+
+    # 9. Prepare headers for the creator's API
     headers = {}
     for header in ['Content-Type', 'Accept', 'User-Agent']:
         if header in request.headers:
             headers[header] = request.headers[header]
+
+    # Add the creator's authentication
     creator_key = decrypt_api_key(product.creator_api_key)
     if product.auth_type == 'header':
         headers[product.auth_header_name] = creator_key
@@ -647,6 +671,8 @@ def api_gateway(product_id, endpoint):
     elif product.auth_type == 'basic':
         credentials = base64.b64encode(f"{creator_key}:".encode()).decode()
         headers['Authorization'] = f'Basic {credentials}'
+
+    # 10. Forward the request to the creator's server
     try:
         if request.method == 'GET':
             resp = requests.get(creator_url, headers=headers, timeout=30)
@@ -660,12 +686,17 @@ def api_gateway(product_id, endpoint):
             resp = requests.patch(creator_url, json=request.get_json(silent=True) or {}, headers=headers, timeout=30)
         else:
             return jsonify({'error': 'Method not supported'}), 405
+
+        # 11. Log the request
         purchase.requests_count += 1
         purchase.last_used = datetime.datetime.utcnow()
         db.session.commit()
+
+        # 12. Return the response
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         response_headers = [(name, value) for name, value in resp.raw.headers.items() if name.lower() not in excluded_headers]
         return Response(resp.content, resp.status_code, response_headers)
+
     except requests.exceptions.Timeout:
         return jsonify({'error': 'Upstream API timeout'}), 504
     except requests.exceptions.ConnectionError:
@@ -716,9 +747,161 @@ def test_proxy(current_user):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# REVIEWS, FORUM, ANALYTICS, ADMIN, HEALTH routes unchanged (same as before)
+# REVIEWS, FORUM, ANALYTICS, ADMIN, HEALTH routes unchanged...
+# (they remain the same as in previous full version)
+# We'll add them back quickly:
+@app.route('/api/products/<int:product_id>/reviews', methods=['GET'])
+def get_reviews(product_id):
+    reviews = Review.query.filter_by(product_id=product_id).order_by(Review.created_at.desc()).all()
+    return jsonify([r.to_dict() for r in reviews]), 200
 
-# ─── SEED DATABASE & AUTO-MIGRATION ─────────────────────
+@app.route('/api/products/<int:product_id>/reviews', methods=['POST'])
+@token_required
+def create_review(current_user, product_id):
+    data = request.json
+    rating = data.get('rating')
+    comment = data.get('comment')
+    if not rating or rating < 1 or rating > 5:
+        return jsonify({'error': 'Rating must be 1-5'}), 400
+    purchase = Purchase.query.filter_by(consumer_id=current_user.id, product_id=product_id).first()
+    if not purchase:
+        return jsonify({'error': 'You must have access to review'}), 403
+    review = Review(user_id=current_user.id, product_id=product_id, rating=rating, comment=comment)
+    db.session.add(review)
+    product = Product.query.get(product_id)
+    if product:
+        all_reviews = Review.query.filter_by(product_id=product_id).all()
+        product.avg_rating = sum(r.rating for r in all_reviews) / len(all_reviews) if all_reviews else rating
+    db.session.commit()
+    return jsonify(review.to_dict()), 201
+
+@app.route('/api/forum/topics', methods=['GET'])
+def get_topics():
+    product_id = request.args.get('product_id', type=int)
+    query = ForumTopic.query
+    if product_id:
+        query = query.filter_by(product_id=product_id)
+    topics = query.order_by(ForumTopic.pinned.desc(), ForumTopic.created_at.desc()).all()
+    return jsonify([t.to_dict() for t in topics]), 200
+
+@app.route('/api/forum/topics', methods=['POST'])
+@token_required
+def create_topic(current_user):
+    data = request.json
+    product_id = data.get('productId')
+    title = data.get('title')
+    if not product_id or not title:
+        return jsonify({'error': 'Missing fields'}), 400
+    topic = ForumTopic(product_id=product_id, user_id=current_user.id, title=title)
+    db.session.add(topic)
+    db.session.commit()
+    return jsonify(topic.to_dict()), 201
+
+@app.route('/api/forum/topics/<int:topic_id>/posts', methods=['GET'])
+def get_posts(topic_id):
+    posts = ForumPost.query.filter_by(topic_id=topic_id).order_by(ForumPost.created_at.asc()).all()
+    return jsonify([p.to_dict() for p in posts]), 200
+
+@app.route('/api/forum/topics/<int:topic_id>/posts', methods=['POST'])
+@token_required
+def create_post(current_user, topic_id):
+    data = request.json
+    content = data.get('content')
+    if not content:
+        return jsonify({'error': 'Content required'}), 400
+    post = ForumPost(topic_id=topic_id, user_id=current_user.id, content=content)
+    db.session.add(post)
+    db.session.commit()
+    return jsonify(post.to_dict()), 201
+
+@app.route('/api/forum/topics/<int:topic_id>/pin', methods=['POST'])
+@token_required
+def pin_topic(current_user, topic_id):
+    topic = ForumTopic.query.get(topic_id)
+    if not topic:
+        return jsonify({'error': 'Topic not found'}), 404
+    data = request.json
+    pinned = data.get('pinned', False)
+    topic.pinned = pinned
+    db.session.commit()
+    return jsonify({'success': True, 'pinned': pinned}), 200
+
+@app.route('/api/analytics/me', methods=['GET'])
+@token_required
+def get_analytics(current_user):
+    purchases = Purchase.query.filter_by(consumer_id=current_user.id).all()
+    total_requests = sum(p.requests_count for p in purchases)
+    active_keys = sum(1 for p in purchases if p.is_active())
+    my_products = Product.query.filter_by(creator_id=current_user.id).all()
+    product_ids = [p.id for p in my_products]
+    product_purchases = Purchase.query.filter(Purchase.product_id.in_(product_ids)).all() if product_ids else []
+    total_api_calls = sum(p.requests_count for p in product_purchases)
+    total_subscribers = len(product_purchases)
+    top_products = []
+    if my_products:
+        usage = {}
+        for p in my_products:
+            usage[p.id] = sum(pur.requests_count for pur in product_purchases if pur.product_id == p.id)
+        top_products = sorted(usage.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_products = [{'product_id': pid, 'calls': count, 'product_name': next((p.name for p in my_products if p.id == pid), 'Unknown')} for pid, count in top_products]
+    return jsonify({
+        'totalRequests': total_requests,
+        'activeKeys': active_keys,
+        'totalApiCalls': total_api_calls,
+        'totalSubscribers': total_subscribers,
+        'myEarnings': current_user.earnings,
+        'topProducts': top_products
+    }), 200
+
+@app.route('/admin/users', methods=['GET'])
+@token_required
+def admin_list_users(current_user):
+    if current_user.role != 'admin':
+        return jsonify({'error': 'Admin only'}), 403
+    users = User.query.all()
+    return jsonify([u.to_dict() for u in users]), 200
+
+@app.route('/admin/users/<int:user_id>', methods=['PUT'])
+@token_required
+def admin_update_user(current_user, user_id):
+    if current_user.role != 'admin':
+        return jsonify({'error': 'Admin only'}), 403
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    data = request.json
+    if 'role' in data:
+        user.role = data['role']
+    if 'earnings' in data:
+        user.earnings = data['earnings']
+    db.session.commit()
+    return jsonify({'success': True, 'user': user.to_dict()}), 200
+
+@app.route('/admin/users/<int:user_id>', methods=['DELETE'])
+@token_required
+def admin_delete_user(current_user, user_id):
+    if current_user.role != 'admin':
+        return jsonify({'error': 'Admin only'}), 403
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    db.session.delete(user)
+    db.session.commit()
+    return jsonify({'success': True}), 200
+
+@app.route('/admin/products', methods=['GET'])
+@token_required
+def admin_list_products(current_user):
+    if current_user.role != 'admin':
+        return jsonify({'error': 'Admin only'}), 403
+    products = Product.query.all()
+    return jsonify([p.to_dict(include_sensitive=True) for p in products]), 200
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy'}), 200
+
+# ─── DATABASE SETUP & MIGRATION ─────────────────────
 with app.app_context():
     try:
         db.create_all()
@@ -761,27 +944,9 @@ with app.app_context():
             )
             db.session.add_all([demo_user, admin_user])
             db.session.commit()
-
-            products = [
-                Product(
-                    creator_id=demo_user.id, name='Weather API',
-                    description='Real-time weather data for any location worldwide.',
-                    category='Weather', icon='☁️', color='#4285f4',
-                    price_display='$5/month', plan_type='month', plan_duration=1,
-                    endpoint_url='https://api.weatherapi.com/v1', auth_type='header',
-                    auth_header_name='X-API-Key', creator_api_key=encrypt_api_key('demo-weather-key-12345'),
-                    rate_limits=json.dumps({"Free":"100/day","Pro":"10000/month"}),
-                    pricing_tiers=json.dumps([{"name":"Free","price":0,"planType":"lifetime","duration":0},{"name":"Pro","price":5,"planType":"month","duration":1}])
-                ),
-                # (other seeded products remain the same as previous version)
-            ]
-            for p in products:
-                db.session.add(p)
-            db.session.commit()
             print("✅ Seeding complete!")
         except Exception as e:
             print(f"❌ Seeding error: {e}")
-            sys.exit(1)
 
 print("=" * 50)
 print("✅ API Marketplace with Gateway is ready! 🚀")
